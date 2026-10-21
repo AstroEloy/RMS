@@ -184,7 +184,7 @@ from RMS.Astrometry.Conversions import date2JD, JD2HourAngle, trueRaDec2Apparent
     apparentAltAz2TrueRADec, J2000_JD, jd2Date, datetime2JD, JD2LST, geo2Cartesian, vector2RaDec, raDec2Vector
 from RMS.Astrometry.AstrometryNet import astrometryNetSolve
 from RMS.Astrometry.ApplyRecalibrate import recalibrateFF
-from RMS.Astrometry.AutoPlatepar import selectBestFrame, autoFitPlatepar
+from RMS.Astrometry.AutoPlatepar import selectBestFrame, autoFitPlatepar, plateparModel, applyPlateparModel
 from RMS.Astrometry.NNalign import alignPlatepar
 import RMS.ConfigReader as cr
 from RMS.ExtractStars import extractStarsAndSave, extractStarsFF
@@ -2533,10 +2533,6 @@ class PlateTool(QtWidgets.QMainWindow):
         self.auto_compute_sattracks = show_sattracks  # Enable auto-compute if satellite tracks requested
         self.tle_file = tle_file
         self.satellite_tracks = []
-        
-        # Cache for FOV polygon to avoid recomputation
-        self.fov_poly_cache = None
-        self.fov_poly_jd = None
 
         self.sat_track_curves = []
         self.sat_track_labels = []
@@ -3480,6 +3476,7 @@ class PlateTool(QtWidgets.QMainWindow):
         self.tab.param_manager.sigRefractionToggled.connect(self.onRefractionChanged)
         self.tab.param_manager.sigEqAspectToggled.connect(self.onFitParametersChanged)
         self.tab.param_manager.sigForceDistortionToggled.connect(self.onFitParametersChanged)
+        self.tab.param_manager.sigDecenteringCorrToggled.connect(self.onFitParametersChanged)
         self.tab.param_manager.sigOnVignettingFixedToggled.connect(self.onVignettingChanged)
 
         # Connect astrometry & photometry buttons to functions
@@ -9558,6 +9555,9 @@ class PlateTool(QtWidgets.QMainWindow):
             if not hasattr(self.platepar, "asymmetry_corr"):
                 self.platepar.asymmetry_corr = False
 
+            if not hasattr(self.platepar, "decentering_corr"):
+                self.platepar.decentering_corr = False
+
             if not hasattr(self.platepar, "extinction_scale"):
                 self.platepar.extinction_scale = 1.0
 
@@ -9790,10 +9790,6 @@ class PlateTool(QtWidgets.QMainWindow):
             self.tle_file = None
         if not hasattr(self, "satellite_tracks"):
             self.satellite_tracks = []
-        if not hasattr(self, "fov_poly_cache"):
-            self.fov_poly_cache = None
-        if not hasattr(self, "fov_poly_jd"):
-            self.fov_poly_jd = None
         if not hasattr(self, "sat_track_curves"):
             self.sat_track_curves = []
         if not hasattr(self, "sat_track_labels"):
@@ -10713,9 +10709,13 @@ class PlateTool(QtWidgets.QMainWindow):
                 self.updateDistortion()
                 self.updateStars()
 
-            # Make new platepar
+            # Make new platepar, its model of the distortion shown in the fit parameters
             elif (event.key() == QtCore.Qt.Key.Key_N) and (modifiers == QtCore.Qt.KeyboardModifier.ControlModifier):
                 self.makeNewPlatepar()
+                self.tab.param_manager.updatePlatepar()
+                self.updateLeftLabels()
+                self.updateDistortion()
+                self.updateStars()
 
             # Show distortion
             elif (event.key() == QtCore.Qt.Key.Key_I) and (modifiers == QtCore.Qt.KeyboardModifier.ControlModifier):
@@ -12173,6 +12173,49 @@ class PlateTool(QtWidgets.QMainWindow):
         self.img_zoom.setLevels(self.tab.hist.getLevels())
         self.updateLeftLabels()
 
+    def computeFOVPolygon(self, jd):
+        """ Compute the FOV polygon on the sky by sampling the image edges with the current platepar.
+
+        The polygon is not cached because it changes with the platepar as well as with the time, and it
+        only takes a few milliseconds to compute.
+
+        Arguments:
+            jd: [float] Julian date.
+
+        Return:
+            fov_poly: [list] List of (RA, Dec) tuples of the polygon vertices, in degrees.
+        """
+
+        w = self.platepar.X_res
+        h = self.platepar.Y_res
+
+        # Define edges: (x1, y1) -> (x2, y2)
+        edges = [
+            ((0, 0), (w, 0)),   # Top
+            ((w, 0), (w, h)),   # Right
+            ((w, h), (0, h)),   # Bottom
+            ((0, h), (0, 0))    # Left
+        ]
+
+        samples_per_side = 10
+
+        fov_poly = []
+        for (x_start, y_start), (x_end, y_end) in edges:
+            xs = np.linspace(x_start, x_end, samples_per_side, endpoint=False)
+            ys = np.linspace(y_start, y_end, samples_per_side, endpoint=False)
+
+            # Prepare inputs
+            n = len(xs)
+            jd_arr = [jd]*n
+            level_arr = [1]*n
+
+            _, r_arr, d_arr, _ = xyToRaDecPP(jd_arr, xs, ys, level_arr, self.platepar, jd_time=True, extinction_correction=False)
+
+            for r, d in zip(r_arr, d_arr):
+                fov_poly.append((r, d))
+
+        return fov_poly
+
     def updateConstellations(self):
         """ Projects and draws constellation lines. """
 
@@ -12189,43 +12232,12 @@ class PlateTool(QtWidgets.QMainWindow):
         # 0. Generate FOV polygon
         w = self.platepar.X_res
         h = self.platepar.Y_res
-        fov_poly = []
 
-        if self.fov_poly_cache is not None and self.fov_poly_jd == jd:
-            fov_poly = self.fov_poly_cache
-        else:
-            # Define edges: (x1, y1) -> (x2, y2)
-            edges = [
-                ((0, 0), (w, 0)),   # Top
-                ((w, 0), (w, h)),   # Right
-                ((w, h), (0, h)),   # Bottom
-                ((0, h), (0, 0))    # Left
-            ]
-            
-            samples_per_side = 10
-            
-            try:
-                for (x_start, y_start), (x_end, y_end) in edges:
-                    xs = np.linspace(x_start, x_end, samples_per_side, endpoint=False)
-                    ys = np.linspace(y_start, y_end, samples_per_side, endpoint=False)
-                    
-                    # Prepare inputs
-                    n = len(xs)
-                    jd_arr = [jd]*n
-                    level_arr = [1]*n
-                    
-                    _, r_arr, d_arr, _ = xyToRaDecPP(jd_arr, xs, ys, level_arr, self.platepar, jd_time=True, extinction_correction=False)
-                    
-                    for r, d in zip(r_arr, d_arr):
-                        fov_poly.append((r, d))
-                        
-                # Update cache
-                self.fov_poly_cache = fov_poly
-                self.fov_poly_jd = jd
-                
-            except Exception as e:
-                print(f"Error computing FOV polygon for constellations: {e}")
-                return
+        try:
+            fov_poly = self.computeFOVPolygon(jd)
+        except Exception as e:
+            print(f"Error computing FOV polygon for constellations: {e}")
+            return
 
         # 1. Filter using sphericalPolygonCheck
         # Check start and end points
@@ -12746,6 +12758,7 @@ class PlateTool(QtWidgets.QMainWindow):
         user_distortion_type = self.platepar.distortion_type
         user_equal_aspect = self.platepar.equal_aspect
         user_asymmetry_corr = self.platepar.asymmetry_corr
+        user_decentering_corr = self.platepar.decentering_corr
         user_force_distortion_centre = self.platepar.force_distortion_centre
         user_refraction = self.platepar.refraction
         user_fit_only_pointing = self.fit_only_pointing
@@ -12843,6 +12856,7 @@ class PlateTool(QtWidgets.QMainWindow):
             self.platepar.refraction = True
             self.platepar.remapCoeffsForFlagChange('equal_aspect', True)
             self.platepar.remapCoeffsForFlagChange('asymmetry_corr', False)
+            self.platepar.remapCoeffsForFlagChange('decentering_corr', False)
             self.platepar.remapCoeffsForFlagChange('force_distortion_centre', False)
             self.platepar.setDistortionType("radial5-odd", reset_params=False)
 
@@ -12934,6 +12948,7 @@ class PlateTool(QtWidgets.QMainWindow):
         # Use remapCoeffsForFlagChange to properly handle coefficient structure changes
         self.platepar.remapCoeffsForFlagChange('equal_aspect', user_equal_aspect)
         self.platepar.remapCoeffsForFlagChange('asymmetry_corr', user_asymmetry_corr)
+        self.platepar.remapCoeffsForFlagChange('decentering_corr', user_decentering_corr)
         self.platepar.remapCoeffsForFlagChange('force_distortion_centre', user_force_distortion_centre)
         self.platepar.refraction = user_refraction
         self.fit_only_pointing = user_fit_only_pointing
@@ -13655,6 +13670,7 @@ class PlateTool(QtWidgets.QMainWindow):
         user_distortion_type = self.platepar.distortion_type
         user_equal_aspect = self.platepar.equal_aspect
         user_asymmetry_corr = self.platepar.asymmetry_corr
+        user_decentering_corr = self.platepar.decentering_corr
         user_force_distortion_centre = self.platepar.force_distortion_centre
         user_refraction = self.platepar.refraction
         user_fit_only_pointing = self.fit_only_pointing
@@ -13664,6 +13680,7 @@ class PlateTool(QtWidgets.QMainWindow):
         self.platepar.refraction = True
         self.platepar.equal_aspect = True
         self.platepar.asymmetry_corr = False
+        self.platepar.decentering_corr = False
         self.platepar.force_distortion_centre = False
 
         # Start with radial5-odd for initial fitting, reset distortion params
@@ -13901,6 +13918,7 @@ class PlateTool(QtWidgets.QMainWindow):
             print("Restoring user settings: {:s}".format(user_distortion_type))
             self.platepar.remapCoeffsForFlagChange('equal_aspect', user_equal_aspect)
             self.platepar.remapCoeffsForFlagChange('asymmetry_corr', user_asymmetry_corr)
+            self.platepar.remapCoeffsForFlagChange('decentering_corr', user_decentering_corr)
             self.platepar.remapCoeffsForFlagChange('force_distortion_centre', user_force_distortion_centre)
             self.platepar.setDistortionType(user_distortion_type, reset_params=False)
             self.platepar.refraction = user_refraction
@@ -13941,6 +13959,7 @@ class PlateTool(QtWidgets.QMainWindow):
             # Restore user's settings even if fit failed
             self.platepar.equal_aspect = user_equal_aspect
             self.platepar.asymmetry_corr = user_asymmetry_corr
+            self.platepar.decentering_corr = user_decentering_corr
             self.platepar.force_distortion_centre = user_force_distortion_centre
             self.platepar.setDistortionType(user_distortion_type, reset_params=True)
             self.platepar.refraction = user_refraction
@@ -14587,8 +14606,9 @@ class PlateTool(QtWidgets.QMainWindow):
         scale_y = self.config.fov_h/self.config.height
         self.platepar.F_scale = 1.0/((scale_x + scale_y)/2)
 
-        # Reset the distortion coeffs
-        self.platepar.resetDistortionParameters()
+        # The model of the distortion from the config file, with the coefficients reset
+        applyPlateparModel(self.platepar, plateparModel(self.config), reset_params=True)
+        self.dist_type_index = self.platepar.distortion_type_list.index(self.platepar.distortion_type)
 
 
         # Set station ID
@@ -16895,48 +16915,11 @@ class PlateTool(QtWidgets.QMainWindow):
         jd = datetime2JD(t_start)
         
         # Generate FOV polygon by sampling edges
-        w = self.platepar.X_res
-        h = self.platepar.Y_res
-        
-        # Check if we can use cached FOV polygon
-        fov_poly = []
-        if self.fov_poly_cache is not None and self.fov_poly_jd == jd:
-            fov_poly = self.fov_poly_cache
-            # print("Using cached FOV polygon.")
-        else:
-            # print("Computing FOV polygon...")
-            # Define edges: (x1, y1) -> (x2, y2)
-            edges = [
-                ((0, 0), (w, 0)),   # Top
-                ((w, 0), (w, h)),   # Right
-                ((w, h), (0, h)),   # Bottom
-                ((0, h), (0, 0))    # Left
-            ]
-            
-            samples_per_side = 10
-            
-            try:
-                for (x_start, y_start), (x_end, y_end) in edges:
-                    xs = np.linspace(x_start, x_end, samples_per_side, endpoint=False)
-                    ys = np.linspace(y_start, y_end, samples_per_side, endpoint=False)
-                    
-                    # Prepare inputs
-                    n = len(xs)
-                    jd_arr = [jd]*n
-                    level_arr = [1]*n
-                    
-                    _, r_arr, d_arr, _ = xyToRaDecPP(jd_arr, xs, ys, level_arr, self.platepar, jd_time=True, extinction_correction=False)
-                    
-                    for r, d in zip(r_arr, d_arr):
-                        fov_poly.append((r, d))
-                        
-                # Update cache
-                self.fov_poly_cache = fov_poly
-                self.fov_poly_jd = jd
-                
-            except Exception as e:
-                print(f"Error computing FOV polygon: {e}")
-                return
+        try:
+            fov_poly = self.computeFOVPolygon(jd)
+        except Exception as e:
+            print(f"Error computing FOV polygon: {e}")
+            return
 
         try:
             self.satellite_tracks = predictor.getSatelliteTracks(self.platepar, fov_poly, sats)
@@ -17536,8 +17519,12 @@ class PlateTool(QtWidgets.QMainWindow):
             else:
                 img_h = self.img.data.shape[1]
 
-            # Compute the corrected frame time
-            frame_no = RollingShutterCorrection.correctRollingShutterTemporal(frame, pick['y_centroid'], img_h)
+            # Compute the corrected frame time, with the readout time of the rows of the sensor and the crop of
+            #   the capture for the inputs from the RMS capture (see RMS.Routines.RollingShutterCorrection)
+            fps = getattr(self.img_handle, 'fps', None) if self.img_handle is not None else None
+            cropped = (self.img_handle is None) or RollingShutterCorrection.croppedInput(self.img_handle.input_type)
+            frame_no = RollingShutterCorrection.correctFrameTime(frame, pick['y_centroid'], img_h, self.config,
+                                                                 fps=fps, cropped=cropped)
 
         # If global shutter, do no correction
         else:
