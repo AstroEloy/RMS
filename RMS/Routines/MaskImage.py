@@ -68,6 +68,24 @@ class MaskStructure(object):
         return None
 
 
+    def masked(self, x, y):
+        """ Flag the image points that fall on masked pixels.
+
+        Arguments:
+            x: [ndarray] X image coordinates (px).
+            y: [ndarray] Y image coordinates (px).
+
+        Return:
+            [ndarray of bool] True where the pixel under the point is masked (0). Points outside the
+                mask take the value of the nearest border pixel.
+        """
+
+        x_int = np.clip(np.asarray(x).astype(int), 0, self.img.shape[1] - 1)
+        y_int = np.clip(np.asarray(y).astype(int), 0, self.img.shape[0] - 1)
+
+        return self.img[y_int, x_int] == 0
+
+
     def checkMask(self, x_res, y_res):
         """ Check the if the mask resolution matches and reset it if it doesn't. """
 
