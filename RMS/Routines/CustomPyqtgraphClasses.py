@@ -4169,8 +4169,7 @@ class SettingsWidget(QtWidgets.QWidget, ScaledSizeHelper):
         self.save_photometry_pixels = QtWidgets.QCheckBox('Save Photometry Pixels')
         self.save_photometry_pixels.setToolTip("Save the pixels used for the photometry of every pick "
             "(position, RA/Dec, Alt/Az, raw and background-subtracted intensity) to a CSV file next to "
-            "the ECSV file. A pick's pixels are recorded when its photometry is computed, i.e. when leaving "
-            "its frame or saving.")
+            "the ECSV file")
         self.save_photometry_pixels.released.connect(self.sigSavePhotometryPixelsToggled.emit)
         self.updateSavePhotometryPixels()
         self.save_photometry_pixels.hide()

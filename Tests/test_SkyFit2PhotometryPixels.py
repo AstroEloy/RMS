@@ -70,9 +70,8 @@ class PickingSession(object):
         for x, y in PIXELS:
             data[x, y] = BACKGROUND + SIGNAL
 
-        self.mode = 'manualreduction'
         self.frame = 10
-        self.img = types.SimpleNamespace(data=data, getFrame=lambda: self.frame)
+        self.img = types.SimpleNamespace(data=data, img_showing='frame', getFrame=lambda: self.frame)
         self.img_handle = FrameTimes(avepixel)
         self.config = cr.Config()
         self.config.stationID = "XX0001"
@@ -178,15 +177,17 @@ def test_values_are_only_kept_from_the_last_computation_with_the_option_on(tmp_p
     assert 'photometry_pixel_values' not in pick
 
 
-def test_photometry_is_not_measured_in_skyfit_mode(tmp_path):
-    """ The SkyFit mode keeps the picks and the current frame but shows the avepixel: computing the photometry
-        there (e.g. on saving) leaves the intensity sum measured on the frame as it is. """
+@pytest.mark.parametrize("img_showing", ['avepixel', 'maxpixel'])
+def test_photometry_is_only_measured_on_the_frame(tmp_path, img_showing):
+    """ The SkyFit mode (avepixel) and the maxpixel view keep the picks and the current frame: computing the
+        photometry while they are shown (e.g. on saving, or leaving the frame) leaves the intensity sum measured on
+        the frame as it is. """
 
     session = PickingSession(str(tmp_path))
     pick = session.pick(session.frame, 902.0, 502.0, PIXELS)
     session.computeIntensitySum()
 
-    session.mode = 'skyfit'
+    session.img.img_showing = img_showing
     session.img.data = session.img_handle.ff.avepixel.T
     session.computeIntensitySum()
 
