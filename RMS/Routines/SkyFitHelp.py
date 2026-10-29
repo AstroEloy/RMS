@@ -671,9 +671,6 @@ def _topic_settings(gui):
         ("Invert Colors", "Invert the image (dark stars on a light background)."),
         ("Auto Pan To Next Star", "Recentre the view on the next star while picking."),
         ("Single Click Photometry", "Measure photometry with a single click while picking."),
-        ("Save Photometry Pixels", "On saving, also write the pixels used for the photometry of every "
-         "pick (position, RA/Dec, Alt/Az, raw and background-subtracted intensity) to a "
-         "_photometry_pixels.csv file next to the ECSV file. Also turned on with <b>--photpixels</b>."),
     ]
 
     if _has_geopoints(gui):
