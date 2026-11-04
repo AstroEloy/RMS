@@ -10025,6 +10025,15 @@ class PlateTool(QtWidgets.QMainWindow):
         for k, v in variables.items():
             setattr(self, k, v)
 
+        # From a running session, what was computed for the stars of its catalog doesn't match the catalog of the state
+        for k in [k for k in vars(self) if k.startswith('catalog_stars_') and (k not in variables)]:
+            setattr(self, k, None)
+
+        for k in ('_star_label_cache', '_star_label_html_spectral', '_star_label_html_name',
+                  '_filtered_original_indices'):
+            if hasattr(self, k) and (k not in variables):
+                delattr(self, k)
+
         # Whether the state was saved before the readout time of the rolling shutter could be set (see the end)
         old_rolling_shutter = "rolling_shutter_readout" not in vars(self.config)
 
