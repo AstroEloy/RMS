@@ -14,11 +14,12 @@ import pytest
 pytest.importorskip("pyqtgraph")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pyqtgraph as pg
 from pyqtgraph.Qt import QtWidgets
 
 from RMS.Formats.Platepar import Platepar
 from RMS.Routines.CustomPyqtgraphClasses import AnnotationsWidget, FRAGMENT_COLORS
-from Utils.SkyFit2 import PlateTool
+from Utils.SkyFit2 import GREAT_CIRCLE_COLOR, PlateTool
 
 
 LEGACY_COLUMNS = ['datetime', 'ra', 'dec', 'azimuth', 'altitude', 'x_image', 'y_image',
@@ -469,6 +470,152 @@ def test_colouring_shows_every_fragment(tmp_path):
     assert session.drawn[-1][MAIN_PIXELS[0]] == 11
     assert session.drawn[-1][FRAGMENT_PIXELS[0]] == 2
     assert np.count_nonzero(session.drawn[-1]) == len(MAIN_PIXELS) + len(FRAGMENT_PIXELS)
+
+
+class GreatCircles(Reduction):
+    """ Stand-in for PlateTool with the great circle lines. """
+
+    updateGreatCircle = PlateTool.updateGreatCircle
+    drawGreatCircle = PlateTool.drawGreatCircle
+    removeCentroid = PlateTool.removeCentroid
+    getCurrentPick = PlateTool.getCurrentPick
+
+    def __init__(self, dir_path):
+
+        Reduction.__init__(self, dir_path)
+
+        self.frame = 10
+        self.img = SimpleNamespace(getFrame=lambda: self.frame)
+        self.tab = SimpleNamespace(debruijn=SimpleNamespace(removeRow=lambda frame: None))
+        self.img_handle.currentFrameTime = lambda dt_obj=False: self.img_handle.beginning_datetime
+        self.platepar.F_scale = 20.0
+        self.platepar.updateRefRADec(skip_rot_update=True)
+
+        self.great_circle_line = pg.PlotCurveItem()
+        self.fragment_great_circle_lines = {k: pg.PlotCurveItem() for k in range(1, len(FRAGMENT_COLORS))}
+
+
+def lineColor(line):
+    return line.opts['pen'].color().getRgb()[:3]
+
+
+def distanceToLine(line, x, y):
+    """ Distance in pixels from an image point to the closest segment of a line. """
+
+    x_line, y_line = line.getData()
+    xa, ya, xb, yb = x_line[:-1], y_line[:-1], x_line[1:], y_line[1:]
+
+    t = np.clip(((x - xa)*(xb - xa) + (y - ya)*(yb - ya))/((xb - xa)**2 + (yb - ya)**2), 0, 1)
+
+    return np.min(np.hypot(xa + t*(xb - xa) - x, ya + t*(yb - ya) - y))
+
+
+def test_great_circle_colour_follows_the_fragments(qapp, tmp_path):
+    """ The main line is purple until there are other fragments, and a fragment needs two points for its own. """
+
+    session = GreatCircles(tmp_path)
+    session.addPick(10, 200.0, 100.0)
+    session.addPick(14, 400.0, 200.0)
+    session.addPick(18, 600.0, 300.0)
+
+    session.updateGreatCircle()
+    main_line = session.great_circle_line.getData()[0].copy()
+    assert lineColor(session.great_circle_line) == GREAT_CIRCLE_COLOR
+
+    # With the first point of a fragment only the colour of the main line changes
+    session.addFragmentPoint(10, 3, 200.0, 400.0)
+    session.updateGreatCircle()
+    assert lineColor(session.great_circle_line) == FRAGMENT_COLORS[0]
+    assert np.array_equal(session.great_circle_line.getData()[0], main_line)
+    assert session.fragment_great_circle_lines[3].getData()[0] is None
+
+    # With the second point the fragment gets its line, and the others have none
+    session.addFragmentPoint(14, 3, 500.0, 420.0)
+    session.updateGreatCircle()
+    assert len(session.fragment_great_circle_lines[3].getData()[0]) > 0
+    assert session.fragment_great_circle_lines[1].getData()[0] is None
+
+    # Removing the points goes back step by step
+    session.removeFragmentPoint(14, 3)
+    session.updateGreatCircle()
+    assert session.fragment_great_circle_lines[3].getData()[0] is None
+    assert lineColor(session.great_circle_line) == FRAGMENT_COLORS[0]
+
+    session.removeFragmentPoint(10, 3)
+    session.updateGreatCircle()
+    assert lineColor(session.great_circle_line) == GREAT_CIRCLE_COLOR
+
+
+def test_great_circle_of_a_fragment_goes_through_its_points(qapp, tmp_path):
+    """ Each line is fitted only to the points of its fragment, also when they share frames. """
+
+    session = GreatCircles(tmp_path)
+    session.addPick(10, 200.0, 100.0)
+    session.addPick(14, 400.0, 200.0)
+    session.addPick(18, 600.0, 300.0)
+    session.addFragmentPoint(10, 1, 200.0, 400.0)
+    session.addFragmentPoint(14, 1, 500.0, 420.0)
+    session.addFragmentPoint(14, 2, 700.0, 100.0)
+    session.addFragmentPoint(18, 2, 800.0, 600.0)
+    session.updateGreatCircle()
+
+    # The lines are in pixel centre coordinates
+    for x, y in ((200.5, 100.5), (400.5, 200.5), (600.5, 300.5)):
+        assert distanceToLine(session.great_circle_line, x, y) < 1
+
+    line1, line2 = session.fragment_great_circle_lines[1], session.fragment_great_circle_lines[2]
+    for x, y in ((200.5, 400.5), (500.5, 420.5)):
+        assert distanceToLine(line1, x, y) < 1
+    for x, y in ((700.5, 100.5), (800.5, 600.5)):
+        assert distanceToLine(line2, x, y) < 1
+
+    # The points of a fragment are far from the line of another one
+    assert distanceToLine(line1, 700.5, 100.5) > 50
+
+
+def test_great_circle_of_main_leaves_out_unused_picks_only(qapp, tmp_path):
+    """ The main picks not used in the trajectory don't count, and those of the fragments are all used. """
+
+    session = GreatCircles(tmp_path)
+    session.addPick(10, 200.0, 100.0)
+    session.addPick(14, 400.0, 200.0, trajectory_use=False)
+    session.addFragmentPoint(10, 1, 200.0, 400.0)
+    session.addFragmentPoint(14, 1, 500.0, 420.0)
+    session.updateGreatCircle()
+
+    assert session.great_circle_line.getData()[0] is None
+    assert len(session.fragment_great_circle_lines[1].getData()[0]) > 0
+
+
+def test_removing_a_main_pick_refits_the_great_circle(qapp, tmp_path):
+    """ The line of the main fragment doesn't stay on a pick which is no longer there. """
+
+    session = GreatCircles(tmp_path)
+    session.addPick(10, 200.0, 100.0)
+    session.addPick(14, 400.0, 200.0)
+    session.addPick(18, 600.0, 500.0)
+    session.updateGreatCircle()
+    assert distanceToLine(session.great_circle_line, 400.5, 200.5) > 1
+
+    session.frame = 18
+    session.removeCentroid(18)
+    assert distanceToLine(session.great_circle_line, 400.5, 200.5) < 1
+
+    session.frame = 14
+    session.removeCentroid(14)
+    assert session.great_circle_line.getData()[0] is None
+
+
+def test_no_great_circles_with_ground_points(qapp, tmp_path):
+    """ As for the main fragment, ground points have no great circle. """
+
+    session = GreatCircles(tmp_path)
+    session.meas_ground_points = True
+    session.addFragmentPoint(10, 1, 200.0, 400.0)
+    session.addFragmentPoint(14, 1, 500.0, 420.0)
+    session.updateGreatCircle()
+
+    assert session.fragment_great_circle_lines[1].getData()[0] is None
 
 
 class Gui(object):
