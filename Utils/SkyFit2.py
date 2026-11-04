@@ -3745,6 +3745,10 @@ class PlateTool(QtWidgets.QMainWindow):
             new_mode [str]: either 'skyfit' or 'manualreduction'
 
         """
+        # There is nothing to show in either mode with no data loaded (SkyFit2 started with no input)
+        if not self.hasData():
+            return
+
         # Won't update image if not necessary
         if self.mode == new_mode:
             first_time = True
@@ -10051,8 +10055,8 @@ class PlateTool(QtWidgets.QMainWindow):
             self.star_aperture_radius = self.star_aperature_radius
 
 
-        # Update img_handle parameters
-        if hasattr(self, "img_handle"):
+        # Update img_handle parameters (a session started with no input has none to update)
+        if getattr(self, "img_handle", None) is not None:
 
             # Update the dir path
             self.img_handle.dir_path = dir_path
@@ -10380,6 +10384,12 @@ class PlateTool(QtWidgets.QMainWindow):
             
             # Get and set the new img_handle
             self.detectInputType(load=True, beginning_time=self.beginning_time)
+
+            # Recreate the saturation mask with the image size of the state
+            saturation_mask_img = np.zeros_like(self.img_handle.loadChunk().maxpixel).T
+            self.saturation_mask_img = np.zeros(saturation_mask_img.shape + (4,), dtype='uint8')
+            self.saturation_mask.setImage(self.saturation_mask_img)
+
             self.img.changeHandle(self.img_handle)
             self.img_zoom.changeHandle(self.img_handle)
 
@@ -10390,6 +10400,14 @@ class PlateTool(QtWidgets.QMainWindow):
             #   min/max levels, and an unchanged histogram won't re-emit them)
             self.img.setLevels(self.tab.hist.getLevels())
             self.img_zoom.setLevels(self.tab.hist.getLevels())
+
+            # Update the view limits to the image size of the state
+            img_width = self.img.data.shape[0]
+            img_height = self.img.data.shape[1]
+            if img_height/img_width < self.img_frame.height()/self.img_frame.width():
+                self.img_frame.setLimits(xMin=0, xMax=img_width, yMin=None, yMax=None)
+            else:
+                self.img_frame.setLimits(xMin=None, xMax=None, yMin=0, yMax=img_height)
 
             self.img_frame.autoRange(padding=0)
 
@@ -10403,7 +10421,9 @@ class PlateTool(QtWidgets.QMainWindow):
             self.tab.settings.updateGeoMarkerScale()
             self.changeMode(self.mode)
 
+            self.updatePicks()
             self.updateLeftLabels()
+            self.updateImageNavigationDisplay()
 
 
         # Update the FPS if forced
