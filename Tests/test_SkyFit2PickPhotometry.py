@@ -85,6 +85,7 @@ class PickingSession(object):
         self.peripheral_background_subtraction = peribg
         self.saturation_threshold = int(round(0.98*(2**self.config.bit_depth - 1)))
         self.save_photometry_pixels = save_photometry_pixels
+        self.fragment_picks = {}
         self.pick_list = {}
 
     def pick(self, frame, x, y, pixels):
