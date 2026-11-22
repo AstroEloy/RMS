@@ -372,10 +372,15 @@ def runWithTimeout(func, args=(), kwargs=None, timeout=60, on_late_completion=No
     if kwargs is None:
         kwargs = {}
 
+    # Results are shared with the worker thread through mutable containers. The lock makes "the
+    # function completed" and "the caller gave up" mutually exclusive decisions: without it the
+    # worker could finish between the caller's check and the caller setting timed_out, so neither
+    # side ran on_late_completion while the caller reported a timeout (leaking e.g. an SSH client)
     result = [None]
     exception = [None]
     timed_out = [False]
     completed = threading.Event()
+    state_lock = threading.Lock()
 
     def target():
         try:
@@ -383,8 +388,14 @@ def runWithTimeout(func, args=(), kwargs=None, timeout=60, on_late_completion=No
         except Exception as e:
             exception[0] = e
         finally:
-            completed.set()
-            if timed_out[0] and on_late_completion is not None:
+
+            # Mark the completion and read the caller's decision in one step
+            with state_lock:
+                completed.set()
+                late = timed_out[0]
+
+            # The caller has already given up - run the late cleanup here
+            if late and (on_late_completion is not None):
                 log.debug("runWithTimeout: function completed after caller timed out; running late cleanup")
                 try:
                     on_late_completion()
@@ -398,13 +409,18 @@ def runWithTimeout(func, args=(), kwargs=None, timeout=60, on_late_completion=No
     # Wait for completion or timeout
     completed.wait(timeout)
 
-    if completed.is_set():
+    # Decide under the lock, so a function finishing right now either counts as completed or sees
+    # the timeout flag and runs its late cleanup
+    with state_lock:
+
         # Function completed (possibly with exception)
-        return (True, result[0], exception[0])
-    else:
-        # Timed out — flag thread so on_late_completion fires if it finishes later
+        if completed.is_set():
+            return (True, result[0], exception[0])
+
+        # Timed out - flag the thread so on_late_completion fires if it finishes later
         timed_out[0] = True
-        return (False, None, None)
+
+    return (False, None, None)
 
 
 ### Safe git invocation ###
@@ -690,12 +706,18 @@ def hostReachable(host, port=443, timeout=GIT_REACHABILITY_TIMEOUT):
         This is a cheap pre-check which fails fast on a DNS failure, a dead link or a blackholed
         route, so that a slow network operation is not even attempted.
 
+        The whole attempt, including the name lookup, runs under a hard deadline. The socket timeout
+        alone is not enough, as create_connection() resolves the host with a blocking getaddrinfo()
+        before that timeout applies, so a stalled DNS resolver during an outage would hold the
+        caller here for as long as the resolver library waits (minutes with long resolver timeouts
+        or several name servers), or for good if the lookup itself hangs.
+
     Arguments:
         host: [str] Host name or IP address.
 
     Keyword arguments:
         port: [int] TCP port. 443 by default.
-        timeout: [float] Connection timeout in seconds.
+        timeout: [float] Deadline for the name lookup and the connection together, in seconds.
 
     Return:
         [bool] True if the connection succeeded.
@@ -705,28 +727,47 @@ def hostReachable(host, port=443, timeout=GIT_REACHABILITY_TIMEOUT):
     if host is None:
         return False
 
-    sock = None
+    # The socket is kept in a list so that the late cleanup below can reach it
+    sock_holder = [None]
 
-    try:
 
-        # Open a connection and drop it straight away, only reachability matters here
-        sock = socket.create_connection((host, port), timeout=timeout)
-        return True
+    def _closeSocket():
+        """ Release the socket, if one was opened. """
 
-    except Exception as e:
+        if sock_holder[0] is not None:
+            try:
+                sock_holder[0].close()
 
-        # A refused connection, a DNS failure and a timeout are all treated the same way
-        log.debug("Host {:s}:{:d} is not reachable: {:s}".format(str(host), int(port), repr(e)))
+            # Nothing more can be done with a socket which cannot be closed
+            except Exception as e:
+                log.debug("Could not close the socket to {:s}: {:s}".format(str(host), repr(e)))
+
+
+    def _connect():
+        """ Open a connection and keep the socket, only reachability matters here. """
+
+        sock_holder[0] = socket.create_connection((host, port), timeout=timeout)
+
+
+    # Run the lookup and the connection in a daemon thread with a hard deadline. A connection which
+    # comes through after the deadline is closed by the late cleanup.
+    completed, _, exception = runWithTimeout(_connect, timeout=timeout, on_late_completion=_closeSocket)
+
+    # The DNS lookup or the connection did not finish in time
+    if not completed:
+        log.debug("Host {:s}:{:d} is not reachable: no answer within {:.1f} s".format(str(host), int(port),
+            float(timeout)))
         return False
 
-    finally:
+    # Always release the socket, even when the connection failed halfway through
+    _closeSocket()
 
-        # Always release the socket, even when the connection failed halfway through
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:
-                pass
+    # A refused connection, a DNS failure and a socket timeout are all treated the same way
+    if exception is not None:
+        log.debug("Host {:s}:{:d} is not reachable: {:s}".format(str(host), int(port), repr(exception)))
+        return False
+
+    return True
 
 
 def killProcessGroup(proc):
@@ -855,6 +896,79 @@ def runGitCommand(args, cwd=None, timeout=GIT_NETWORK_TIMEOUT, network=False):
                 file_handle.close()
             except Exception:
                 pass
+
+
+# Timeout of the local git commands which read the commit of the code (s)
+GIT_LOCAL_TIMEOUT = 10.0
+
+# The tracked files whose changes make the code differ from its commit (the configuration, the mask and the
+#   camera settings are tracked as well and are edited on every station)
+GIT_CODE_PATHSPECS = ['*.py', '*.pyx', '*.pxd', '*.pyxbld', '*.c', '*.cpp', '*.h']
+
+# The commit of the RMS code of this process, read once (see rmsCommit)
+_RMS_COMMIT = None
+
+
+def gitCommit(dir_path, timeout=GIT_LOCAL_TIMEOUT):
+    """ The commit checked out in a git working tree, never failing.
+
+    Arguments:
+        dir_path: [str] Root directory of the working tree.
+
+    Keyword arguments:
+        timeout: [float] Timeout of each git command (s). GIT_LOCAL_TIMEOUT by default.
+
+    Return:
+        [str] The short hash of the commit, with '+' appended if a tracked code file (GIT_CODE_PATHSPECS)
+            differs from it or if that could not be checked. 'unknown' if the directory is not the root of a
+            git working tree (e.g. an installed copy inside another repository) or git could not be run.
+    """
+
+    try:
+
+        # The root of the working tree and the commit, both in one call
+        code, out, _ = runGitCommand(['-C', dir_path, 'rev-parse', '--show-toplevel', '--short', 'HEAD'],
+                                     timeout=timeout)
+        lines = [line.strip() for line in out.strip().splitlines()]
+        if (code != 0) or (len(lines) != 2) or (not lines[1]):
+            return 'unknown'
+
+        # The directory has to be the root itself, not a directory inside some other repository
+        top_level, commit = lines
+        if os.path.normcase(os.path.realpath(top_level)) != os.path.normcase(os.path.realpath(dir_path)):
+            return 'unknown'
+
+        # Changes of the tracked code, staged or not (exit code 1), or a check which did not work
+        code, _, _ = runGitCommand(['-C', dir_path, 'diff', '--quiet', 'HEAD', '--'] + GIT_CODE_PATHSPECS,
+                                   timeout=timeout)
+        if code != 0:
+            commit += '+'
+
+        return commit
+
+    except Exception:
+
+        # No git, a timeout or anything else: the commit is not known
+        return 'unknown'
+
+
+def rmsCommit():
+    """ The commit of the RMS code of this process (see gitCommit), read once and kept.
+
+    Return:
+        [str] Short hash of the commit, with '+' if the code has changes, or 'unknown'.
+    """
+
+    global _RMS_COMMIT
+
+    # Read only the first time, the code of a running process does not change
+    if _RMS_COMMIT is None:
+        try:
+            _RMS_COMMIT = gitCommit(getRmsRootDir())
+        except Exception:
+            _RMS_COMMIT = 'unknown'
+
+    return _RMS_COMMIT
 
 
 ### ###

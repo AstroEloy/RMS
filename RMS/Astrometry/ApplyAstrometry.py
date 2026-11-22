@@ -39,14 +39,17 @@ import numpy as np
 import RMS.Formats.Platepar
 import scipy.optimize
 from RMS.Astrometry.AtmosphericExtinction import atmosphericExtinctionCorrection
-from RMS.Astrometry.Conversions import (J2000_JD, trueOfDateRaDec2J2000,
+from RMS.Astrometry.Conversions import (trueOfDateRaDec2J2000,
                                         date2JD, 
                                         jd2Date, 
                                         raDec2AltAz,
                                         trueRaDec2ApparentAltAz,
                                         AEGeoidH2LatLonAlt,
                                         geo2Cartesian,
-                                        vector2RaDec
+                                        vector2RaDec,
+                                        latLonAlt2ENU,
+                                        enu2LatLonAlt,
+                                        enHeight2Up
                                         )
 from RMS.Formats.FFfile import filenameToDatetime
 from RMS.Formats.FTPdetectinfo import (findFTPdetectinfoFile,
@@ -60,9 +63,11 @@ import pyximport
 pyximport.install(setup_args={'include_dirs':[np.get_include()]})
 from RMS.Astrometry.CyFunctions import (cyraDecToXY, cyTrueRaDec2ApparentAltAz,
                                         cyTrueRaDec2ApparentAltAz_vect,
+                                        cyAltAzHeight2ENU,
+                                        cyTargetRefraction, cyTargetRefractionRange,
                                         cyXYToRADec,
                                         eqRefractionApparentToTrue, eqRefractionTrueToApparent,
-                                        refractionScale,
+                                        refractionScale, removeAberration,
                                         trueOfDateFromJ2000)
 
 # Handle Python 2/3 compatibility
@@ -923,7 +928,7 @@ def calculateMagnitudes(px_sum_arr, radius_arr, photom_offset, vignetting_coeff)
 
 
 def xyToRaDecPP(time_data, X_data, Y_data, level_data, platepar, extinction_correction=True, \
-    measurement=False, jd_time=False, precompute_pointing_corr=False):
+    measurement=False, jd_time=False, precompute_pointing_corr=False, aberration=None, horizontal=False):
     """ Converts image XY to RA,Dec, but it takes a platepar instead of individual parameters. 
 
     Arguments:
@@ -933,27 +938,42 @@ def xyToRaDecPP(time_data, X_data, Y_data, level_data, platepar, extinction_corr
             if jd_time is True - Julian dates.
         X_data: [ndarray] 1D numpy array containing the image X component.
         Y_data: [ndarray] 1D numpy array containing the image Y component.
-        level_data: [ndarray] Levels of the meteor centroid.
+        level_data: [ndarray] Levels of the meteor centroid. None skips the photometry, for points whose
+            directions only are needed (the magnitudes are then returned as None).
         platepar: [Platepar structure] Astrometry parameters.
 
     Keyword arguments:
         extinction_correction: [bool] Apply extinction correction. True by default. False is set to prevent 
             infinite recursion in extinctionCorrectionApparentToTrue when set to True.
-        measurement: [bool] Indicates if the given images values are image measurements. Used for correcting
-            celestial coordinates for refraction if the refraction was not taken into account during
-            plate fitting.
+        measurement: [bool] Indicates if the given image values are image measurements (meteor centroids,
+            picks) rather than stars. False by default. Used for correcting celestial coordinates for
+            refraction if the refraction was not taken into account during plate fitting, and to decide
+            about the annual aberration: stars (False) have it removed so the output is a catalog direction,
+            while an object in the atmosphere (True) is not aberrated and the output is its geometric direction
+            in the Earth's frame, which is what a trajectory solver uses.
         jd_time: [bool] If True, time_data is expected as a list of Julian dates. False by default.
         precompute_pointing_corr: [bool] Precompute the pointing correction. False by default. This is used
             to speed up the calculation when the input JD is the same for all data points, e.g. during
             plate solving.
-
+        aberration: [bool or None] Remove the annual aberration so the output is a catalog direction. None
+            (default) means "not measurement". Set it to False for a direction fixed to the Earth (a
+            ground reference, a landmark, an object at a finite distance that moves with the Earth): its
+            light is not aberrated, and the measurement flag must not be used for that, since on an
+            unrefracted plate measurement=True also triggers the post-hoc refraction correction.
+            Never done for a plate fitted without the aberration modelled (platepar.aberration False),
+            which has absorbed it.
+        horizontal: [bool] Return the azimuth (+east of due north) and the altitude at the dates (deg) in
+            place of RA and Dec: the direction the light arrives from in the frame of the Earth, without the
+            refraction of a star, the post-hoc measurement correction or the annual aberration taken out.
+            False by default.
 
     Return:
         (JD_data, RA_data, dec_data, magnitude_data): [tuple of ndarrays]
             JD_data: [ndarray] Julian date of each data point.
             RA_data: [ndarray] Right ascension of each point (deg).
             dec_data: [ndarray] Declination of each point (deg).
-            magnitude_data: [ndarray] Array of meteor's lightcurve apparent magnitudes.
+            magnitude_data: [ndarray] Array of meteor's lightcurve apparent magnitudes, None without
+                level_data.
     """
 
 
@@ -970,12 +990,15 @@ def xyToRaDecPP(time_data, X_data, Y_data, level_data, platepar, extinction_corr
         float(platepar.dec_d), float(platepar.pos_angle_ref), float(platepar.F_scale), platepar.x_poly_fwd, 
         platepar.y_poly_fwd, unicode(platepar.distortion_type), refraction=platepar.refraction, \
         equal_aspect=platepar.equal_aspect, force_distortion_centre=platepar.force_distortion_centre, \
-        asymmetry_corr=platepar.asymmetry_corr, precompute_pointing_corr=precompute_pointing_corr, \
-        decentering_corr=getattr(platepar, "decentering_corr", False), refraction_scale=refractionScale(platepar.elev))
+        asymmetry_corr=platepar.asymmetry_corr, precompute_pointing_corr=precompute_pointing_corr,
+        decentering_corr=getattr(platepar, "decentering_corr", False),
+        refraction_scale=refractionScale(platepar.elev), \
+        aberration=plateAberration(platepar, measurement, aberration), horizontal=horizontal)
 
     # Correct the coordinates for refraction if it wasn't taken into account during the astrometry calibration
     #   procedure
-    if (not platepar.refraction) and measurement and platepar.measurement_apparent_to_true_refraction:
+    if (not horizontal) and (not platepar.refraction) and measurement \
+        and platepar.measurement_apparent_to_true_refraction:
 
         refr_scale = refractionScale(platepar.elev)
 
@@ -987,6 +1010,10 @@ def xyToRaDecPP(time_data, X_data, Y_data, level_data, platepar, extinction_corr
             RA_data[i] = np.degrees(ra)
             dec_data[i] = np.degrees(dec)
             
+
+    # Without levels only the directions are wanted
+    if level_data is None:
+        return JD_data, RA_data, dec_data, None
 
     # Compute radii from image centre
     radius_arr = np.hypot(np.array(X_data) - platepar.X_res/2, np.array(Y_data) - platepar.Y_res/2)
@@ -1006,13 +1033,28 @@ def xyToRaDecPP(time_data, X_data, Y_data, level_data, platepar, extinction_corr
 
 
 
-def raDecToXYPP(RA_data, dec_data, jd, platepar):
+def raDecToXYPP(RA_data, dec_data, jd, platepar, measurement=False, aberration=None, horizontal=False):
     """ Converts RA, Dec to image coordinates, but the platepar is given instead of individual parameters.
     Arguments:
         RA: [ndarray] Array of right ascensions (degrees).
         dec: [ndarray] Array of declinations (degrees).
-        jd: [float] Julian date.
+        jd: [float or ndarray] Julian date, or the Julian date of every point (an array of the same length as
+            RA), which gives the same coordinates as a call per point at its own date.
         platepar: [Platepar structure] Astrometry parameters.
+
+    Keyword arguments:
+        measurement: [bool] False (default) for catalog directions of stars, which are displaced by the annual
+            aberration before projection. True for directions in the Earth's frame (e.g. a meteor position
+            from a trajectory), which are not aberrated.
+        aberration: [bool or None] Apply the annual aberration before projecting. None (default) means
+            "not measurement". Set it to False for a direction fixed to the Earth (ground reference,
+            landmark), see xyToRaDecPP.
+            Never done for a plate fitted without the aberration modelled (platepar.aberration False),
+            which has absorbed it.
+        horizontal: [bool] RA_data and dec_data are the azimuth (+east of due north) and the altitude at jd
+            (deg): the direction the light arrives from in the frame of the Earth, which is neither refracted nor
+            aberrated. False by default.
+
     Return:
         (x, y): [tuple of ndarrays] Image X and Y coordinates. With platepar.exact_reverse set, the exact inverse
             of xyToRaDecPP, through the forward distortion; otherwise through the reverse distortion.
@@ -1020,6 +1062,14 @@ def raDecToXYPP(RA_data, dec_data, jd, platepar):
 
     # The exact inverse of the forward mapping, or the separately fitted reverse distortion
     exact_reverse = getattr(platepar, "exact_reverse", False)
+
+    # A date per point
+    jd_data = None
+    if np.ndim(jd) > 0:
+        jd_data = np.ascontiguousarray(jd, dtype=np.float64)
+        if len(jd_data) != len(RA_data):
+            raise ValueError("raDecToXYPP: {:d} dates for {:d} points".format(len(jd_data), len(RA_data)))
+        jd = jd_data[0] if len(jd_data) else 0.0
 
     # Use the cythonized function instead of the Python function
     X_data, Y_data = cyraDecToXY(RA_data, dec_data, float(jd), float(platepar.lat), float(platepar.lon),
@@ -1029,10 +1079,38 @@ def raDecToXYPP(RA_data, dec_data, jd, platepar):
         platepar.y_poly_fwd if exact_reverse else platepar.y_poly_rev, unicode(platepar.distortion_type), 
         refraction=platepar.refraction, equal_aspect=platepar.equal_aspect, 
         force_distortion_centre=platepar.force_distortion_centre, asymmetry_corr=platepar.asymmetry_corr,
-        decentering_corr=getattr(platepar, "decentering_corr", False), refraction_scale=refractionScale(platepar.elev),
-        invert_forward=exact_reverse)
+        decentering_corr=getattr(platepar, "decentering_corr", False), invert_forward=exact_reverse,
+        jd_data=jd_data, refraction_scale=refractionScale(platepar.elev), \
+        aberration=plateAberration(platepar, measurement, aberration), horizontal=horizontal)
 
     return X_data, Y_data
+
+
+
+def plateAberration(platepar, measurement, aberration):
+    """ Whether the kernels have to model the annual aberration for the given plate and directions (see
+        xyToRaDecPP and raDecToXYPP).
+
+    Arguments:
+        platepar: [Platepar] Astrometry parameters.
+        measurement: [bool] The directions are measurements of an object in the atmosphere, not stars.
+        aberration: [bool or None] Choice of the caller, None to decide from measurement.
+
+    Return:
+        [bool] True if the aberration is applied (raDecToXYPP) or removed (xyToRaDecPP).
+    """
+
+    # A plate fitted without the aberration modelled has absorbed it, so it is never applied to it. Plates
+    #   older than the flag (e.g. pickled ones) are such plates
+    if not getattr(platepar, 'aberration', False):
+        return False
+
+    # Catalog directions of stars are aberrated, measurements of an object in the atmosphere are not,
+    #   unless the caller says otherwise
+    if aberration is None:
+        return not measurement
+
+    return bool(aberration)
 
 
 
@@ -1192,8 +1270,9 @@ def applyPlateparToRaDecCentroids(ff_name, fps, meteor_meas, platepar, add_calst
         t_list = [t.year, t.month, t.day, t.hour, t.minute, t.second, int(t.microsecond/1000)]
         time_data.append(t_list)
 
-        # Convert RA/Dec to image coordinates
-        x, y = raDecToXYPP(np.array([ra]), np.array([dec]), date2JD(*t_list), platepar)
+        # Convert RA/Dec to image coordinates. They are measured directions of the meteor (as xyToRaDecPP
+        #   gives them with measurement=True), which are not aberrated
+        x, y = raDecToXYPP(np.array([ra]), np.array([dec]), date2JD(*t_list), platepar, measurement=True)
         X_data.append(x[0])
         Y_data.append(y[0])
 
@@ -1234,16 +1313,19 @@ def applyPlateparToRaDecCentroids(ff_name, fps, meteor_meas, platepar, add_calst
 def xyHt2Geo(platepar, x, y, h):
     """ Given pixel coordinates on the image and a height of the target above sea level,
         compute geo coordinates of the point. The assumption is that the target is close enough for the
-        refraction not to be needed to be applied.
+        refraction not to be needed to be applied: the point is placed along the arrival direction of the
+        light at the pixel.
 
     Arguments:
         platepar: [Platepar object]
-        x: [float] Image X coordinate
-        y: [float] Image Y coordinate
-        h: [float] elevation of the target in meters (WGS84)
+        x: [float or ndarray] Image X coordinate
+        y: [float or ndarray] Image Y coordinate
+        h: [float or ndarray] elevation of the target in meters (WGS84)
 
     Return:
-        (lat, lon): [tuple of floats] latitude in degrees (+north), longitude in degrees (+east), 
+        (lat, lon): [tuple of ndarrays] latitude in degrees (+north), longitude in degrees (+east), one
+            element per pixel (also for scalar inputs). NaN where the line of sight never reaches the
+            height h.
 
     """
 
@@ -1252,7 +1334,7 @@ def xyHt2Geo(platepar, x, y, h):
     #   camera actually looks along the apparent one, which offsets the whole field by the refraction at
     #   the FOV centre. switchToGroundPicks() re-derives the reference pointing from the apparent alt/az,
     #   so the plate maps a pixel straight onto the arrival direction of the light, which for a target on
-    #   the ground is its true direction.
+    #   the ground is taken as its true direction (its terrestrial refraction is not modelled).
     platepar = copy.deepcopy(platepar)
     platepar.updateRefAltAz()
     platepar.switchToGroundPicks()
@@ -1289,7 +1371,8 @@ def xyHt2Geo(platepar, x, y, h):
         [platepar.JD]*len(x), x, y, [1]*len(x),
         platepar, 
         extinction_correction=False, precompute_pointing_corr=True, jd_time=True,
-        measurement=False # Disables refraction correction
+        measurement=False, # No post-hoc refraction correction: the plate is already refraction-free
+        aberration=False   # A direction fixed to the Earth is not aberrated
         )
         
     # Apparent alt/az of every pixel, without refraction (the plate is in the ground representation)
@@ -1340,13 +1423,14 @@ def geoHt2RaDec(platepar, jd, lat, lon, h):
     return ra, dec
 
 
-def targetRaDecToPlateRaDec(ra_data, dec_data, jd, platepar, refraction_fraction=0.0):
+def targetRaDecToPlateRaDec(ra_data, dec_data, jd, platepar, refraction_fraction=0.0, aberration=True):
     """ Convert the true J2000 direction of a target whose light is refracted by only a fraction of a
         star's refraction into the coordinates that have to be given to the plate as a fit reference.
 
         The plate maps a catalog direction to an image position by first refracting it as if it were a
         star, which is correct for a star and for anything else outside the atmosphere. A target inside or
-        below the atmosphere is bent by less than that: a ground reference is not bent at all, and a target
+        below the atmosphere is bent by less than that: a ground reference only by the terrestrial
+        refraction along its low path (tens of arcsec over 10 km and more, not modelled here), and a target
         at a finite height only by the fraction returned by refractionTargetFraction(). Handing the plate
         the true direction of such a target therefore places it where a star in that direction would be
         seen, not where the target is seen, and a fit made against it absorbs the difference into the
@@ -1358,10 +1442,15 @@ def targetRaDecToPlateRaDec(ra_data, dec_data, jd, platepar, refraction_fraction
 
             input = T^-1(T(true_dir, fraction*scale), scale)
 
-        With fraction = 0 that is just the plate's own refraction removed. A plate fitted against such
-        references is an ordinary refraction-on plate: measurements of meteors and stars made with it come
-        out as true J2000 coordinates through xyToRaDecPP(), and ground picks through
-        Platepar.switchToGroundPicks().
+        With fraction = 0 that is just the plate's own refraction removed. The plate also displaces its
+        input by the annual aberration before refracting it (the star path: aberrate, refract, project),
+        and a target fixed to the Earth is not aberrated, so that displacement is taken out as well:
+
+            input = A^-1(T^-1(T(true_dir, fraction*scale), scale))
+
+        A plate fitted against such references is an ordinary refraction-on plate: measurements of meteors
+        and stars made with it come out as true J2000 coordinates through xyToRaDecPP(), and ground picks
+        through Platepar.switchToGroundPicks().
 
     Arguments:
         ra_data: [ndarray] True J2000 right ascensions of the targets (deg).
@@ -1371,25 +1460,42 @@ def targetRaDecToPlateRaDec(ra_data, dec_data, jd, platepar, refraction_fraction
 
     Keyword arguments:
         refraction_fraction: [float] Fraction of a star's refraction that the target's light undergoes,
-            from RMS.Astrometry.CyFunctions.refractionTargetFraction(). 0.0 by default, which is the value
-            for a ground reference, close enough that no measurable refraction accumulates along the way.
+            from RMS.Astrometry.CyFunctions.refractionTargetFraction(). 0.0 by default, the value used for
+            a ground reference, whose terrestrial refraction is not modelled.
+        aberration: [bool] The plate will be used through the star path, which aberrates its input, so the
+            aberration is taken out of the plate coordinates. True by default. False if the plate is used
+            with aberration=False.
 
     Return:
         (ra_plate, dec_plate): [tuple of ndarrays] Coordinates to hand to the plate (deg, J2000).
 
     """
 
+    # The directions as arrays
     ra_data = np.atleast_1d(np.array(ra_data, dtype=np.float64))
     dec_data = np.atleast_1d(np.array(dec_data, dtype=np.float64))
 
-    # A plate fitted without refraction maps the arrival direction directly, so nothing has to be undone
-    if not platepar.refraction:
-        return ra_data, dec_data
-
+    # Station
     lat = np.radians(platepar.lat)
     lon = np.radians(platepar.lon)
+
+    # A plate fitted without the aberration modelled (or older than the flag) does not apply it, so there is
+    #   nothing to take out
+    aberration = aberration and getattr(platepar, 'aberration', False)
+
+    # A plate fitted without refraction maps the arrival direction directly, so only the aberration has to
+    #   be undone
+    if not platepar.refraction:
+        if not aberration:
+            return ra_data, dec_data
+        out = np.array([removeAberration(np.radians(r), np.radians(d), jd) \
+            for r, d in zip(ra_data, dec_data)])
+        return np.degrees(out[:, 0])%360, np.degrees(out[:, 1])
+
+    # The refraction scale of the station height, the same as the plate uses
     refr_scale = refractionScale(platepar.elev)
 
+    # Every target converted on its own
     ra_plate = np.zeros_like(ra_data)
     dec_plate = np.zeros_like(dec_data)
 
@@ -1407,6 +1513,10 @@ def targetRaDecToPlateRaDec(ra_data, dec_data, jd, platepar, refraction_fraction
         # Remove the refraction the plate will apply, so that the plate maps this back onto the arrival
         #   direction of the target
         ra, dec = eqRefractionApparentToTrue(ra, dec, jd, lat, lon, refr_scale)
+
+        # Remove the aberration the plate will apply
+        if aberration:
+            ra, dec = removeAberration(ra, dec, jd)
 
         ra_plate[i] = np.degrees(ra)%360
         dec_plate[i] = np.degrees(dec)
@@ -1434,7 +1544,7 @@ def geoHt2XY(platepar, lat, lon, h):
     #   camera actually looks along the apparent one, which offsets the whole field by the refraction at
     #   the FOV centre. switchToGroundPicks() re-derives the reference pointing from the apparent alt/az,
     #   so the plate maps a pixel straight onto the arrival direction of the light, which for a target on
-    #   the ground is its true direction.
+    #   the ground is taken as its true direction (its terrestrial refraction is not modelled).
     platepar = copy.deepcopy(platepar)
     platepar.updateRefAltAz()
     platepar.switchToGroundPicks()
@@ -1448,12 +1558,13 @@ def geoHt2XY(platepar, lat, lon, h):
         dec = np.array([dec])
 
     # Project the RA/Dec to the image
-    x, y = raDecToXYPP(ra, dec, platepar.JD, platepar)
+    # A ground target is fixed to the Earth: its direction is not aberrated
+    x, y = raDecToXYPP(ra, dec, platepar.JD, platepar, aberration=False)
     
     return x, y
 
 
-def fovEdgePolygon(platepar, jd, side_sample=10, trim_px=2):
+def fovEdgePolygon(platepar, jd, side_sample=10, trim_px=2, aberration=None):
     """ Compute the polygon describing the edges of the FOV in RA and Dec, with side_sample points on each 
         side. The FOV polygon is trimmed on each end to minimize the effect of the distortion near the edges.
 
@@ -1464,6 +1575,9 @@ def fovEdgePolygon(platepar, jd, side_sample=10, trim_px=2):
     Keyword arguments:
         side_sample: [int] Number of points on each side of the FOV. 10 by default.
         trim_px: [int] Number of pixels to trim on each side. 2 by default.
+        aberration: [bool] Given to xyToRaDecPP: None (the default) gives the edges as catalog directions,
+            in the frame of the stars; False gives them as geometric directions in the Earth's frame, the
+            frame of targets on the ground or in the atmosphere.
 
     Return:
         (x_vert, y_vert, ra_vert, dec_vert): [tuple of ndarrays] Image X and Y coordinates and RA/Dec of the
@@ -1508,10 +1622,10 @@ def fovEdgePolygon(platepar, jd, side_sample=10, trim_px=2):
     x_vert += [trim_px]*y_samples
     y_vert += reversed([i*y/y_samples for i in range(y_samples)])
 
-    # Convert the polygon to RA/Dec
+    # Convert the polygon to RA/Dec, in the frame the caller compares it in
     _, ra_vert, dec_vert, _ = xyToRaDecPP(
         [float(jd)]*len(x_vert), x_vert, y_vert, [1]*len(x_vert), platepar, 
-        extinction_correction=False, jd_time=True, precompute_pointing_corr=True
+        extinction_correction=False, jd_time=True, precompute_pointing_corr=True, aberration=aberration
         )
 
     return x_vert, y_vert, ra_vert, dec_vert
@@ -1538,7 +1652,7 @@ def geoHt2XYInsideFOV(platepar, lat_arr, lon_arr, h_att, side_sample=10):
     #   camera actually looks along the apparent one, which offsets the whole field by the refraction at
     #   the FOV centre. switchToGroundPicks() re-derives the reference pointing from the apparent alt/az,
     #   so the plate maps a pixel straight onto the arrival direction of the light, which for a target on
-    #   the ground is its true direction.
+    #   the ground is taken as its true direction (its terrestrial refraction is not modelled).
     platepar = copy.deepcopy(platepar)
     platepar.updateRefAltAz()
     platepar.switchToGroundPicks()
@@ -1566,8 +1680,10 @@ def geoHt2XYInsideFOV(platepar, lat_arr, lon_arr, h_att, side_sample=10):
             h_att = np.array([h_att]*arr_len)
 
 
-    # Compute the polygon describing the edges of the FOV, with side_sample points on each side
-    _, _, ra_vert, dec_vert = fovEdgePolygon(platepar, platepar.JD, side_sample=side_sample)
+    # Compute the polygon describing the edges of the FOV, with side_sample points on each side, as geometric
+    #   directions in the Earth's frame like the targets below (geoHt2RaDec), so the two are compared in one
+    #   frame
+    _, _, ra_vert, dec_vert = fovEdgePolygon(platepar, platepar.JD, side_sample=side_sample, aberration=False)
 
     # Compute the ra, dec of the target
     ra_arr = []
@@ -1599,9 +1715,517 @@ def geoHt2XYInsideFOV(platepar, lat_arr, lon_arr, h_att, side_sample=10):
         return np.array([]), np.array([]), inside_indices
     
     # Convert the points to image coordinates
-    x, y = raDecToXYPP(ra_inside, dec_inside, platepar.JD, platepar)
+    x, y = raDecToXYPP(ra_inside, dec_inside, platepar.JD, platepar, aberration=False)
 
     return x, y, inside_indices
+
+
+
+### Image coordinates <-> directions and points around the station ###
+
+# The functions below map the image through the plate (xyToRaDecPP and raDecToXYPP in the horizontal frame) at the
+#   reference time of the platepar, so they follow every part of its model, the sky to the image through the exact
+#   inverse or the reverse distortion as the platepar says (exact_reverse); the camera is fixed to the ground, so
+#   the mapping holds at any time. Directions are in the frame of the Earth (a target in the atmosphere moves with
+#   the Earth, so its light is not aberrated). East, north, up coordinates are relative to the station, along its
+#   local horizon (geodetic vertical). Heights are above the WGS84 ellipsoid, the station at Platepar.height_wgs84.
+#   Elevation limits (min_el_deg) apply to the straight line from the station.
+#
+# Refraction: the image gives the direction the light arrives from (xyToAltAzPP). The light of a star crosses the
+#   whole atmosphere, that of a target inside it only the air below the target, so the straight line to the target
+#   is bent from the arrival direction by only a part of the refraction of a star (refractionTargetFraction()):
+#   seen from sea level 0.21 of it for a target at 5 km and 0.38 at 10 km, i.e. 2.0 of the 5.4 arcmin of a star at
+#   10 deg elevation. The first version of these functions (#986) took the whole refraction of a star out of every
+#   line of sight, which puts a target at 11 km seen at 10 deg elevation about 300 m too far, and kilometers too
+#   far near the horizon. targetRefractionApparentToTrue() and targetRefractionTrueToApparent() apply the
+#   refraction of a target at a known height or range, and the functions that know the height use them. They are
+#   valid as refractionTargetFraction() is: within 2% of a ray trace below 30 km at any elevation.
+
+
+def plateRefractionScale(platepar):
+    """ Scale of the refraction of a star, relative to sea level, that the directions of the plate in the
+        horizontal frame lack against the direction the light arrives from.
+
+    Arguments:
+        platepar: [Platepar structure] Astrometry parameters.
+
+    Return:
+        [float] The refraction scale of the station height for a plate fitted to the directions of the stars
+            without refraction, 0 for any other plate: with refraction on, the plate maps the arrival direction
+            and takes the refraction out separately; with the measurements corrected for refraction afterwards
+            (measurement_apparent_to_true_refraction), the plate maps the arrival direction itself.
+
+    """
+
+    # Only a plate fitted without refraction to the directions of the stars as they are gives their direction
+    if (not platepar.refraction) and (not getattr(platepar, 'measurement_apparent_to_true_refraction', False)):
+        return refractionScale(platepar.elev)
+
+    # Any other plate maps the arrival direction
+    return 0.0
+
+
+def xyToPlateAltAz(X_data, Y_data, platepar):
+    """ Direction the light seen at image coordinates arrives from, as azimuth and elevation at the reference time
+        of the platepar, in the frame of the Earth.
+
+    Arguments:
+        X_data: [ndarray] Image X coordinates.
+        Y_data: [ndarray] Image Y coordinates, one per X.
+        platepar: [Platepar structure] Astrometry parameters.
+
+    Return:
+        (azim, elev): [tuple of ndarrays] Azimuth (+east of due north) and elevation (deg).
+
+    """
+
+    # The points as flat arrays
+    X_data = np.atleast_1d(np.asarray(X_data, dtype=np.float64)).ravel()
+    Y_data = np.atleast_1d(np.asarray(Y_data, dtype=np.float64)).ravel()
+
+    # No points, nothing to compute
+    if len(X_data) == 0:
+        return np.array([]), np.array([])
+
+    # Directions through the plate in the horizontal frame of its reference time
+    _, azim, elev, _ = xyToRaDecPP(np.full(len(X_data), float(platepar.JD)), X_data, Y_data, None, platepar,
+        extinction_correction=False, jd_time=True, precompute_pointing_corr=True, horizontal=True)
+
+    # A plate fitted to the stars without refraction gives their directions: the refraction of a star is put back
+    if plateRefractionScale(platepar) > 0:
+        elev = np.degrees(cyTargetRefraction(np.radians(elev), np.full(len(elev), np.inf), float(platepar.elev),
+            apparent_to_true=False))
+
+    return azim, elev
+
+
+def plateAltAzToXY(azim, elev, platepar):
+    """ Image coordinates at which light arriving from the given directions is seen (the inverse of
+        xyToPlateAltAz), through raDecToXYPP: the exact inverse with platepar.exact_reverse, otherwise the reverse
+        distortion fitted with the plate, whose fit error then limits the round trips.
+
+    Arguments:
+        azim: [ndarray] Azimuth (+east of due north) (deg).
+        elev: [ndarray] Elevation (deg), NaN for points that are not projected.
+        platepar: [Platepar structure] Astrometry parameters.
+
+    Return:
+        (x, y): [tuple of ndarrays] Image X and Y coordinates. NaN for NaN directions and, with the exact inverse,
+            for directions beyond the edge of the distortion model.
+
+    """
+
+    # The directions as flat arrays
+    azim = np.atleast_1d(np.asarray(azim, dtype=np.float64)).ravel()
+    elev = np.atleast_1d(np.asarray(elev, dtype=np.float64)).ravel()
+
+    # Only the directions that are given are projected, the others stay NaN
+    x = np.full(len(azim), np.nan)
+    y = np.full(len(azim), np.nan)
+    valid = np.isfinite(azim) & np.isfinite(elev)
+    if not np.any(valid):
+        return x, y
+
+    azim, elev = azim[valid], elev[valid]
+
+    # A plate fitted to the stars without refraction takes their directions: the refraction of a star is taken out
+    if plateRefractionScale(platepar) > 0:
+        elev = np.degrees(cyTargetRefraction(np.radians(elev), np.full(len(elev), np.inf), float(platepar.elev)))
+
+    # Through the plate in the horizontal frame of its reference time
+    x[valid], y[valid] = raDecToXYPP(azim, elev, platepar.JD, platepar, horizontal=True)
+
+    return x, y
+
+
+def targetRefractionArrays(elev_data, platepar, ht_data, range_data, azim_data):
+    """ The arguments of targetRefractionApparentToTrue and targetRefractionTrueToApparent as flat arrays.
+
+    Arguments:
+        elev_data: [float or ndarray] Elevations (deg).
+        platepar: [Platepar structure] Astrometry parameters, for the station.
+        ht_data: [float, ndarray or None] Heights above the WGS84 ellipsoid (m).
+        range_data: [float, ndarray or None] Ranges from the station (m).
+        azim_data: [float, ndarray or None] Azimuths (deg), needed with the ranges.
+
+    Return:
+        (elev, dist, azim, shape, scalar): [tuple] Elevations (radians); heights above sea level (m) or ranges
+            (m); azimuths (radians) or None with heights; the broadcast shape; whether all inputs were scalars.
+
+    """
+
+    # Exactly one way of giving the distance of the targets, and the direction with a range
+    if (ht_data is None) == (range_data is None):
+        raise ValueError("Give either the heights or the ranges of the targets.")
+
+    if (range_data is not None) and (azim_data is None):
+        raise ValueError("The azimuths are needed with the ranges.")
+
+    # Every target as flat arrays of one shape
+    dist_data = ht_data if ht_data is not None else range_data
+    arrays = np.broadcast_arrays(*[np.asarray(v, dtype=np.float64) for v in (elev_data, dist_data,
+        azim_data if azim_data is not None else 0.0)])
+    shape, scalar = arrays[0].shape, (arrays[0].ndim == 0)
+    elev, dist, azim = [np.ascontiguousarray(v, dtype=np.float64).ravel() for v in arrays]
+
+    # Heights above the ellipsoid to heights above sea level, with the geoid height of the station
+    if ht_data is not None:
+        return np.radians(elev), dist - (float(platepar.height_wgs84) - platepar.elev), None, shape, scalar
+
+    return np.radians(elev), dist, np.radians(azim), shape, scalar
+
+
+def targetRefraction(elev_data, platepar, ht_data, range_data, azim_data, apparent_to_true):
+    """ The refraction of targets at a known height or range, see targetRefractionApparentToTrue.
+
+    Arguments:
+        elev_data: [float or ndarray] Elevations (deg).
+        platepar: [Platepar structure] Astrometry parameters, for the station.
+        ht_data: [float, ndarray or None] Heights above the WGS84 ellipsoid (m).
+        range_data: [float, ndarray or None] Ranges from the station (m).
+        azim_data: [float, ndarray or None] Azimuths (deg), needed with the ranges.
+        apparent_to_true: [bool] Take the refraction out (True) or put it in (False).
+
+    Return:
+        [float or ndarray] Converted elevations (deg).
+
+    """
+
+    elev, dist, azim, shape, scalar = targetRefractionArrays(elev_data, platepar, ht_data, range_data, azim_data)
+
+    # By height or by range along the line of sight
+    if azim is None:
+        elev = cyTargetRefraction(elev, dist, float(platepar.elev), apparent_to_true=apparent_to_true)
+    else:
+        elev = cyTargetRefractionRange(azim, elev, dist, float(platepar.lat), float(platepar.lon),
+            float(platepar.height_wgs84), float(platepar.elev), apparent_to_true=apparent_to_true)
+
+    elev = np.degrees(elev)
+
+    return float(elev[0]) if scalar else elev.reshape(shape)
+
+
+def targetRefractionApparentToTrue(elev_data, platepar, ht_data=None, range_data=None, azim_data=None):
+    """ Take the refraction out of the apparent elevation of a target inside the atmosphere (e.g. a contrail or an
+        aircraft) at a known height or range, giving the elevation of the straight line from the station to it.
+        Its light is bent only by the air between it and the station: refractionTargetFraction() of the
+        refraction of a star (Bennett's formula at the refraction scale of the station height, refractionScale()),
+        0.38 of it at 10 km seen from sea level, none at the station height, all of it far above the atmosphere.
+        Use it on the altitude of a pixel from xyToAltAzPP when the range or height of the target is known.
+        Valid as refractionTargetFraction() is: within 2% of a ray trace below 30 km at any elevation, while
+        targets at 100 km and higher should not be taken much below 15 to 20 deg elevation.
+
+    Arguments:
+        elev_data: [float or ndarray] Apparent elevations, the direction the light arrives from (deg).
+        platepar: [Platepar structure] Astrometry parameters, for the station.
+
+    Keyword arguments:
+        ht_data: [float or ndarray] Heights of the targets above the WGS84 ellipsoid (m).
+        range_data: [float or ndarray] Ranges of the targets from the station (m), instead of the heights. The
+            height then follows on the WGS84 ellipsoid from the range along the line of sight, which needs its
+            azimuth.
+        azim_data: [float or ndarray] Azimuths of the lines of sight (deg, +east of due north), with the ranges.
+
+    Return:
+        [float or ndarray] Elevations of the straight lines to the targets (deg).
+
+    """
+
+    return targetRefraction(elev_data, platepar, ht_data, range_data, azim_data, True)
+
+
+def targetRefractionTrueToApparent(elev_data, platepar, ht_data=None, range_data=None, azim_data=None):
+    """ Refract the elevation of the straight line from the station to a target inside the atmosphere at a known
+        height or range, giving the direction its light arrives from. The inverse of
+        targetRefractionApparentToTrue, valid alike.
+
+    Arguments:
+        elev_data: [float or ndarray] Elevations of the straight lines to the targets (deg).
+        platepar: [Platepar structure] Astrometry parameters, for the station.
+
+    Keyword arguments:
+        ht_data: [float or ndarray] Heights of the targets above the WGS84 ellipsoid (m).
+        range_data: [float or ndarray] Ranges of the targets from the station (m), instead of the heights.
+        azim_data: [float or ndarray] Azimuths of the lines of sight (deg, +east of due north), with the ranges.
+
+    Return:
+        [float or ndarray] Apparent elevations (deg).
+
+    """
+
+    return targetRefraction(elev_data, platepar, ht_data, range_data, azim_data, False)
+
+
+def enuHtToXY(E_data, N_data, U_data, ht_data, platepar, min_el_deg):
+    """ Image coordinates of points given by their east, north, up coordinates relative to the station and their
+        heights. The inverse of xyHtToENUPP.
+
+    Arguments:
+        E_data: [ndarray] East coordinates (meters).
+        N_data: [ndarray] North coordinates (meters).
+        U_data: [ndarray] Up coordinates (meters).
+        ht_data: [ndarray] Heights of the points above the WGS84 ellipsoid (meters).
+        platepar: [Platepar structure] Astrometry parameters.
+        min_el_deg: [float] Minimum elevation of the line of sight in degrees, lower points are NaN.
+
+    Return:
+        (x, y): [tuple of ndarrays] Image X and Y coordinates.
+
+    """
+
+    # Direction of the straight line from the station to every point
+    azim = np.degrees(np.arctan2(E_data, N_data))
+    elev = np.degrees(np.arctan2(U_data, np.hypot(E_data, N_data)))
+
+    # Points below the elevation limit are not projected
+    with np.errstate(invalid='ignore'):
+        elev[elev < min_el_deg] = np.nan
+
+    # The direction the light of every point arrives from
+    elev = targetRefractionTrueToApparent(elev, platepar, ht_data=ht_data)
+
+    return plateAltAzToXY(azim, elev, platepar)
+
+
+def xyToAltAzPP(X_data, Y_data, platepar):
+    """ Converts image XY to Alt, Az, but it takes a platepar instead of individual parameters. The direction is
+        the one the light seen at the pixel arrives from (the apparent direction, refracted), at the reference time
+        of the platepar, in the frame of the Earth (without the annual aberration). For the direction of a target
+        at a known height or range seen there, give the altitude (and with a range the azimuth) to
+        targetRefractionApparentToTrue; for a star, to pyRefractionApparentToTrue with the refraction scale of the
+        station height.
+
+    Arguments:
+        X_data: [ndarray] 1D numpy array containing the image X component.
+        Y_data: [ndarray] 1D numpy array containing the image Y component.
+        platepar: [Platepar structure] Astrometry parameters.
+
+    Return:
+        (Alt_data, Az_data): [tuple of ndarrays]
+            Alt_data: [ndarray] Apparent altitude of each point (deg).
+            Az_data: [ndarray] Azimuth of each point (deg, +east of due north).
+    """
+
+    # The direction the light seen at every pixel arrives from
+    azim, elev = xyToPlateAltAz(X_data, Y_data, platepar)
+
+    return elev, azim
+
+
+def xyHtToENUPP(X_data, Y_data, ht_wgs84_m, platepar, min_el_deg=0.0):
+    """ Converts image XY to East-North-Up coordinates at a given WGS-84 height. The light seen at every pixel is
+        followed back to the height: its arrival direction (xyToAltAzPP) less the refraction of a target at that
+        height (targetRefractionApparentToTrue) gives the straight line from the station, which is taken to the
+        height on the WGS84 ellipsoid.
+
+    Arguments:
+        X_data: [ndarray] 1D numpy array containing the image X component.
+        Y_data: [ndarray] 1D numpy array containing the image Y component.
+        ht_wgs84_m: [float or ndarray] Target WGS-84 ellipsoid height(s) in meters.
+        platepar: [Platepar structure] Astrometry parameters.
+
+    Keyword arguments:
+        min_el_deg: [float] Minimum elevation of the line of sight in degrees. Points below this will return
+            NaN. Default: 0.0.
+
+    Return:
+        (E, N, U, Eu, Nu, Uu, az, el): [tuple of ndarrays]
+            E, N, U: [ndarrays] East, North, Up coordinates of intersection point (meters), relative to the
+                station. NaN below min_el_deg and where the line of sight never reaches the height.
+            Eu, Nu, Uu: [ndarrays] East, North, Up unit vector components of the ray direction.
+            az, el: [ndarrays] Azimuth (+east of due north, -pi to pi) and elevation of the ray (radians).
+    """
+
+    # Every pixel with its height, as flat arrays
+    X_data, Y_data, ht_data = (np.ascontiguousarray(arr).ravel() for arr in np.broadcast_arrays(
+        np.atleast_1d(np.asarray(X_data, dtype=np.float64)), np.atleast_1d(np.asarray(Y_data, dtype=np.float64)),
+        np.atleast_1d(np.asarray(ht_wgs84_m, dtype=np.float64))))
+
+    # The direction the light arrives from, less the refraction of a target at the height
+    azim, elev = xyToPlateAltAz(X_data, Y_data, platepar)
+    elev = targetRefractionApparentToTrue(elev, platepar, ht_data=ht_data)
+
+    # Lines of sight below the elevation limit are not followed
+    with np.errstate(invalid='ignore'):
+        elev[elev < min_el_deg] = np.nan
+    azim, elev = np.radians(azim), np.radians(elev)
+
+    # The point where every line of sight reaches the height, solved on the WGS84 ellipsoid (NaN if never)
+    E, N, U = cyAltAzHeight2ENU(azim, elev, ht_data, float(platepar.lat), float(platepar.lon),
+        float(platepar.height_wgs84))
+
+    # Unit vector, azimuth and elevation of every line of sight that reaches the height
+    reached = np.isfinite(E)
+    Eu = np.where(reached, np.cos(elev)*np.sin(azim), np.nan)
+    Nu = np.where(reached, np.cos(elev)*np.cos(azim), np.nan)
+    Uu = np.where(reached, np.sin(elev), np.nan)
+    az = np.arctan2(Eu, Nu)
+    el = np.where(reached, elev, np.nan)
+
+    return E, N, U, Eu, Nu, Uu, az, el
+
+
+def geoToENUPP(lat_geo_deg, lon_geo_deg, h_geo_m, platepar):
+    """ Convert geodetic coordinates to East-North-Up (ENU) coordinates relative to the station. Unlike geoToXYPP,
+        this does not go through the camera projection and works for any point, not just those in the field of
+        view.
+
+    Arguments:
+        lat_geo_deg: [float or ndarray] Target geodetic latitude(s) in degrees.
+        lon_geo_deg: [float or ndarray] Target geodetic longitude(s) in degrees.
+        h_geo_m: [float or ndarray] Target WGS-84 ellipsoid height(s) in meters.
+        platepar: [Platepar structure] Platepar object containing station coordinates.
+
+    Return:
+        (E, N, U): [tuple of floats or ndarrays] East, North, Up coordinates in meters relative to station.
+            Floats if all inputs are scalars.
+    """
+
+    # Position relative to the station
+    E, N, U = latLonAlt2ENU(lat_geo_deg, lon_geo_deg, h_geo_m, platepar.lat, platepar.lon,
+        float(platepar.height_wgs84))
+
+    # Scalars in, scalars out
+    if np.isscalar(lat_geo_deg) and np.isscalar(lon_geo_deg) and np.isscalar(h_geo_m):
+        return float(E), float(N), float(U)
+
+    return np.atleast_1d(E), np.atleast_1d(N), np.atleast_1d(U)
+
+
+def geoToXYPP(lat_data, lon_data, h_data, platepar, min_el_deg=0.0):
+    """ Converts WGS-84 geodetic coordinates to image coordinates: the straight line from the station to the point,
+        refracted as the light of a target at its height (targetRefractionTrueToApparent), through the plate. The
+        inverse of xyHtToENUPP for points given by geodetic coordinates.
+
+    Arguments:
+        lat_data: [ndarray] Array of geodetic latitudes (degrees).
+        lon_data: [ndarray] Array of geodetic longitudes (degrees).
+        h_data: [ndarray] Array of WGS-84 ellipsoid heights (meters).
+        platepar: [Platepar structure] Astrometry parameters.
+
+    Keyword arguments:
+        min_el_deg: [float] Minimum elevation angle of the line of sight in degrees. Points below this are
+            returned as NaN.
+
+    Return:
+        (x, y): [tuple of ndarrays] Image X and Y coordinates. NaN below min_el_deg and, on a platepar with
+            exact_reverse, for directions beyond the edge of the distortion model (see plateAltAzToXY).
+    """
+
+    # Every point as flat arrays
+    lat_data, lon_data, h_data = (np.ascontiguousarray(arr).ravel() for arr in np.broadcast_arrays(
+        np.atleast_1d(np.asarray(lat_data, dtype=np.float64)),
+        np.atleast_1d(np.asarray(lon_data, dtype=np.float64)),
+        np.atleast_1d(np.asarray(h_data, dtype=np.float64))))
+
+    # Position relative to the station
+    E_data, N_data, U_data = latLonAlt2ENU(lat_data, lon_data, h_data, platepar.lat, platepar.lon,
+        float(platepar.height_wgs84))
+
+    return enuHtToXY(E_data, N_data, U_data, h_data, platepar, min_el_deg)
+
+
+def enuToXYPP(E_data, N_data, U_data, platepar, min_el_deg=0.0):
+    """ Converts East-North-Up coordinates to image XY coordinates: the straight line from the station to the
+        point, refracted as the light of a target at its height (targetRefractionTrueToApparent), through the
+        plate. The inverse of xyHtToENUPP.
+
+    Arguments:
+        E_data: [ndarray] Array of East coordinates in meters.
+        N_data: [ndarray] Array of North coordinates in meters.
+        U_data: [ndarray] Array of Up coordinates in meters.
+        platepar: [Platepar structure] Astrometry parameters.
+
+    Keyword arguments:
+        min_el_deg: [float] Minimum elevation of the line of sight in degrees. Points below this will return
+            NaN. Default: 0.0.
+
+    Return:
+        (x, y): [tuple of ndarrays] Image X and Y coordinates. NaN below min_el_deg and, on a platepar with
+            exact_reverse, for directions beyond the edge of the distortion model (see plateAltAzToXY).
+    """
+
+    # Every point as flat arrays
+    E_data, N_data, U_data = (np.ascontiguousarray(arr).ravel() for arr in np.broadcast_arrays(
+        np.atleast_1d(np.asarray(E_data, dtype=np.float64)),
+        np.atleast_1d(np.asarray(N_data, dtype=np.float64)),
+        np.atleast_1d(np.asarray(U_data, dtype=np.float64))))
+
+    # Height of every point, for its refraction
+    _, _, ht_data = enu2LatLonAlt(E_data, N_data, U_data, platepar.lat, platepar.lon,
+        float(platepar.height_wgs84))
+
+    return enuHtToXY(E_data, N_data, U_data, ht_data, platepar, min_el_deg)
+
+
+def enHtToXYPP(E_data, N_data, Ht_data, platepar, min_el_deg=0.0):
+    """ Converts East-North coordinates at specified heights to image XY coordinates. The Up coordinate that puts
+        every point at its height is solved for on the WGS84 ellipsoid, then the point is projected as by
+        enuToXYPP.
+
+    Arguments:
+        E_data: [ndarray] Array of East coordinates in meters (from station).
+        N_data: [ndarray] Array of North coordinates in meters (from station).
+        Ht_data: [float or ndarray] Target WGS-84 ellipsoidal height(s) in meters.
+        platepar: [Platepar structure] Astrometry parameters.
+
+    Keyword arguments:
+        min_el_deg: [float] Minimum elevation of the line of sight in degrees. Points below this will return
+            NaN. Default: 0.0.
+
+    Return:
+        (x, y): [tuple of ndarrays] Image X and Y coordinates.
+    """
+
+    # Every point as flat arrays
+    E_data, N_data, Ht_data = (np.ascontiguousarray(arr).ravel() for arr in np.broadcast_arrays(
+        np.atleast_1d(np.asarray(E_data, dtype=np.float64)),
+        np.atleast_1d(np.asarray(N_data, dtype=np.float64)),
+        np.atleast_1d(np.asarray(Ht_data, dtype=np.float64))))
+
+    # The up coordinate at the height
+    U_data = enHeight2Up(E_data, N_data, Ht_data, platepar.lat, platepar.lon, float(platepar.height_wgs84))
+
+    return enuHtToXY(E_data, N_data, U_data, Ht_data, platepar, min_el_deg)
+
+
+def enHt0ToEnHt1(E0_data, N0_data, Ht0_data, Ht1_data, platepar):
+    """ Convert ENHt coordinates at one height to ENHt at a different height, maintaining the same line of sight
+        from the station: the point at the new height is seen at the same pixel, the light arriving from the same
+        direction, but its refraction is the one of the new height (targetRefractionTrueToApparent and
+        targetRefractionApparentToTrue), so the two points are not on one straight line from the station.
+
+    Arguments:
+        E0_data: [ndarray or float] ENU east coordinate(s) at height Ht0 (meters).
+        N0_data: [ndarray or float] ENU north coordinate(s) at height Ht0 (meters).
+        Ht0_data: [ndarray or float] WGS-84 ellipsoidal height(s) of input points (meters).
+        Ht1_data: [ndarray or float] WGS-84 ellipsoidal height(s) of output points (meters).
+        platepar: [Platepar object] Platepar object with station coordinates.
+
+    Return:
+        (E1, N1, U1): [tuple of ndarrays] ENU coordinates at height Ht1 that lie on the same line of sight,
+            where U1 is the Up component in the ENU system. NaN where the line of sight never reaches Ht1.
+    """
+
+    # Every point as flat arrays
+    E0_data, N0_data, Ht0_data, Ht1_data = (np.ascontiguousarray(arr).ravel() for arr in np.broadcast_arrays(
+        np.atleast_1d(np.asarray(E0_data, dtype=np.float64)),
+        np.atleast_1d(np.asarray(N0_data, dtype=np.float64)),
+        np.atleast_1d(np.asarray(Ht0_data, dtype=np.float64)),
+        np.atleast_1d(np.asarray(Ht1_data, dtype=np.float64))))
+
+    # The point at the first height, and the straight line to it
+    h_station = float(platepar.height_wgs84)
+    U0_data = enHeight2Up(E0_data, N0_data, Ht0_data, platepar.lat, platepar.lon, h_station)
+    azim = np.arctan2(E0_data, N0_data)
+    elev = np.degrees(np.arctan2(U0_data, np.hypot(E0_data, N0_data)))
+
+    # The direction its light arrives from, and the straight line to a target at the second height seen there
+    elev = targetRefractionTrueToApparent(elev, platepar, ht_data=Ht0_data)
+    elev = np.radians(targetRefractionApparentToTrue(elev, platepar, ht_data=Ht1_data))
+
+    # The point where the line of sight reaches the second height, solved on the WGS84 ellipsoid
+    return cyAltAzHeight2ENU(azim, elev, Ht1_data, float(platepar.lat), float(platepar.lon), h_station)
 
 
 

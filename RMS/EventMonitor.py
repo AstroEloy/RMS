@@ -80,7 +80,6 @@ from matplotlib.dates import DateFormatter
 # Import Cython functions
 import pyximport
 pyximport.install(setup_args={'include_dirs':[np.get_include()]})
-from RMS.Astrometry.CyFunctions import refractionScale
 
 log = getLogger("rmslogger")
 EM_RAISE = False
@@ -3359,9 +3358,11 @@ def calstarRaDecToDict(data_dir_path, config, pp, pp_recal_json, r_target, d_tar
         # Convert to arrays
         jd_arr, x_data, y_data, level_data = np.array(jd_list), np.array(x_list), np.array(y_list), np.array(intens_sum_list)
 
-        # Process data into RaDec and apply magnitude corrections
+        # Process data into RaDec and apply magnitude corrections. The CALSTARS entries are stars, so they go
+        #   through the star path (catalog directions, like the target they are compared with and the image
+        #   coordinates computed back from them below)
         jd, ra, dec, mag_arr = xyToRaDecPP(jd_arr, x_data, y_data, level_data, pp,
-                                       jd_time=True, extinction_correction=True, measurement=True)
+                                       jd_time=True, extinction_correction=True)
 
         for j, x, y, intens_sum, r, d, bg, amp, FWHM, mag, x_cs, y_cs, snr, NSatPX in zip(jd, x_list, y_list,
                                                                 intens_sum_list, ra, dec, bg_lvl_list,

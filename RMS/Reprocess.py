@@ -5,11 +5,9 @@ from __future__ import print_function, division, absolute_import
 
 
 import os
-import sys
 import glob
 import json
 import collections
-import traceback
 import argparse
 import random
 import shutil
@@ -237,6 +235,17 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
         # Get the platepar file
         platepar, platepar_path, platepar_fmt = getPlatepar(config, night_data_dir)
 
+        # Automatic calibration: the joint fit of the lens distortion on the whole night (see
+        #   RMS.Astrometry.NightCalibration), so the night is reduced with the best platepar. It never stops the
+        #   processing of the night
+        if config.auto_calibration and (calstars_name is not None):
+            try:
+                from RMS.Astrometry.NightCalibration import endOfNightCalibration
+                platepar, platepar_path, platepar_fmt = endOfNightCalibration(config, night_data_dir, calstars_name,
+                                                                              platepar, platepar_path, platepar_fmt)
+            except Exception:
+                log.warning("The automatic calibration at the end of the night failed", exc_info=True)
+
 
         # Run calibration check and auto astrometry refinement
         if (platepar is not None) and (calstars_name is not None):
@@ -259,7 +268,9 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
                 platepar.write(platepar_path, fmt=platepar_fmt)
 
             else:
-                log.info('Astrometric calibration FAILED!, Using old platepar for calibration...')
+                log.info('Astrometric calibration FAILED! The platepar is not saved, the recalibration starts from '
+                         'the last successful step of the check (the NN alignment or a fit of the pointing), or '
+                         'from the old platepar if no step succeeded...')
                 addObsParam(obs_dict, "photometry_good", "False")
 
             saveObservationSummaryDict(obs_dict)
@@ -292,9 +303,8 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
             try:
                 generateCalibrationReport(config, night_data_dir, platepar=platepar)
 
-            except Exception as e:
-                log.warning('Generating calibration report failed with the message:\n' + repr(e))
-                log.warning(repr(traceback.format_exception(*sys.exc_info())))
+            except Exception:
+                log.warning('Generating calibration report failed', exc_info=True)
 
 
 
@@ -305,9 +315,8 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
                     save_plot=True, plot_activity=True, color_map=config.shower_color_map, 
                     sporadic_color=config.sporadic_color)
 
-            except Exception as e:
-                log.warning('Shower association failed with the message:\n' + repr(e))
-                log.warning(repr(traceback.format_exception(*sys.exc_info())))
+            except Exception:
+                log.warning('Shower association failed', exc_info=True)
 
 
 
@@ -354,9 +363,8 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
 
 
 
-            except Exception as e:
-                log.warning("Generating a FOV KML file failed with the message:\n" + repr(e))
-                log.warning(repr(traceback.format_exception(*sys.exc_info())))
+            except Exception:
+                log.warning("Generating a FOV KML file failed", exc_info=True)
 
 
 
@@ -366,9 +374,8 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
                 prepareFluxFiles(config, night_data_dir, os.path.join(night_data_dir, ftpdetectinfo_name),
                                  mask=mask, platepar=platepar)
 
-            except Exception as e:
-                log.warning("Preparing flux files failed with the message:\n" + repr(e))
-                log.warning(repr(traceback.format_exception(*sys.exc_info())))
+            except Exception:
+                log.warning("Preparing flux files failed", exc_info=True)
 
 
     else:
@@ -384,9 +391,8 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
     try:
         plotFieldsums(night_data_dir, config)
 
-    except Exception as e:
-        log.warning('Plotting field sums failed with message:\n' + repr(e))
-        log.warning(repr(traceback.format_exception(*sys.exc_info())))
+    except Exception:
+        log.warning('Plotting field sums failed', exc_info=True)
 
 
 
@@ -427,7 +433,7 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
                         tar_path = os.path.join(year_dir, '{}_{}_FT.tar.bz2'.format(config.stationID, day))
                         
                         # Use the tarWithProgress function with removal of source
-                        print("Creating archive for {} FT files...".format(day))
+                        log.info("Creating archive for {} FT files...".format(day))
                         archive_success = tarWithProgress(
                             source_dir=day_dir,
                             tar_path=tar_path,
@@ -436,17 +442,17 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
                         )
                         
                         if archive_success:
-                            print("Successfully created tar archive at: {}".format(tar_path))
+                            log.info("Successfully created tar archive at: {}".format(tar_path))
                             # Add to extra files for upload
                             extra_files.append(tar_path)
                         else:
-                            print("Archive creation failed, keeping original directory: {}".format(day_dir))
-                            
-                    except Exception as e:
-                        print("Error in archiving process: {}".format(e))
-        except Exception as e:
-            log.warning('Archiving FT files failed with message:\n' + repr(e))
-            log.warning(repr(traceback.format_exception(*sys.exc_info())))
+                            log.warning("Archive creation failed, keeping original directory: {}".format(
+                                day_dir))
+
+                    except Exception:
+                        log.warning("Error in archiving process for {}".format(day), exc_info=True)
+        except Exception:
+            log.warning('Archiving FT files failed', exc_info=True)
 
 
     log.info('Making a flat...')
@@ -455,9 +461,8 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
     try:
         flat_img = makeFlat(night_data_dir, config)
 
-    except Exception as e:
-        log.warning('Making a flat failed with message:\n' + repr(e))
-        log.warning(repr(traceback.format_exception(*sys.exc_info())))
+    except Exception:
+        log.warning('Making a flat failed', exc_info=True)
         flat_img = None
         
 
@@ -494,9 +499,8 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
             # Add the timelapse to the extra files
             extra_files.append(timelapse_path)
 
-        except Exception as e:
-            log.warning('Generating a timelapse failed with message:\n' + repr(e))
-            log.warning(repr(traceback.format_exception(*sys.exc_info())))
+        except Exception:
+            log.warning('Generating a timelapse failed', exc_info=True)
 
     log.info('Plotting timestamp intervals...')
 
@@ -519,9 +523,8 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
         addObsParam(obs_dict,"dropped_frame_rate",dropped_frame_rate)
 
 
-    except Exception as e:
-        log.warning('Plotting timestamp interval failed with message:\n' + repr(e))
-        log.warning(repr(traceback.format_exception(*sys.exc_info())))
+    except Exception:
+        log.warning('Plotting timestamp interval failed', exc_info=True)
 
     # Generate a config audit report
     log.info('Generate config audit report')
@@ -543,9 +546,8 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
 
         extra_files.append(audit_file_path)
 
-    except Exception as e:
-        log.warning('Generating config audit failed with message:\n' + repr(e))
-        log.warning(repr(traceback.format_exception(*sys.exc_info())))
+    except Exception:
+        log.warning('Generating config audit failed', exc_info=True)
 
 
     ### Add extra files to archive
@@ -670,9 +672,8 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
         extra_files.append(observation_summary_json_path_file_name)
 
 
-    except Exception as e:
-        log.warning('Finalizing Observation Summary failed with message:\n' + repr(e))
-        log.warning(repr(traceback.format_exception(*sys.exc_info())))
+    except Exception:
+        log.warning('Finalizing Observation Summary failed', exc_info=True)
 
     obs_summary_to_log = serialize(config, night_directory=night_data_dir, final=True)
     log.info("\n\nObservation Summary\n===================\n\n" + obs_summary_to_log + "\n\n")
@@ -691,6 +692,15 @@ def processNight(night_data_dir, config, detection_results=None, nodetect=False)
     # Processing is complete. Nothing after this point can leave the night needing a reprocess
     updateProcessingStatus(config, night_data_dir, archiving='completed',
         completed_utc=RmsDateTime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+
+    # Automatic calibration: the periodic refit of the lens distortion on the recent archived nights (see
+    #   RMS.Astrometry.NightCalibration.periodicRefit). It never stops the processing of the night
+    if config.auto_calibration:
+        try:
+            from RMS.Astrometry.NightCalibration import periodicRefit
+            periodicRefit(config)
+        except Exception as e:
+            log.warning("The periodic refit of the automatic calibration failed: {:s}".format(repr(e)))
 
 
     return night_archive_dir, archive_name, imgdata_archive_name, metadata_archive_name, detector

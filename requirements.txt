@@ -22,16 +22,16 @@ cython>=3.0.6 ; python_version>='3.13'
 scipy>=1.0.0
 Pillow>=4.3.0
 astropy>=2.0.3
-# Used by the precession/nutation tests as the reference model (installed by astropy>=4.2 anyway)
-pyerfa
 imreg_dft @ git+https://github.com/matejak/imreg_dft@master
 configparser==4.0.2
 imageio>=2.31
 python-dvr>=0.0.1 ; python_version >='3.6'
 pyqtgraph>=0.12,<0.13 ; python_version >='3.6'
 pyyaml; python_version>='3.6'
-tflite-runtime; python_version >= '3.6' and python_version < '3.12' and sys_platform != 'darwin'
+tflite-runtime; python_version >= '3.6' and python_version < '3.12' and sys_platform == 'linux'
 ai-edge-litert>=1.3 ; python_version >= '3.12' and platform_machine != "armv6l" and platform_machine != "armv7l"
+# tflite-runtime has no Windows wheels after Python 3.8; ai-edge-litert, its successor, has them from 2.1.2
+ai-edge-litert>=2.1.2 ; python_version >= '3.10' and python_version < '3.12' and sys_platform == 'win32'
 astrometry; python_version >= "3.8" and sys_platform != 'win32'
 astrometry==3.0.0; python_version >= "3.5" and python_version < "3.8" and sys_platform != 'win32'
 pyclean>=2.7.6; python_version >= "3.5"
